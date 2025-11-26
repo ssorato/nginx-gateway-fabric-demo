@@ -53,7 +53,7 @@ VIP endpoint:
 curl -skL -H 'X-User-Type: vip' $DEMO_URL/vip
 ```
 
-## Clenup
+## Cleanup
 
 ```bash
 task destroy
