@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: endpoint-root
+  namespace: demo
+spec:
+  selector:
+    matchLabels:
+      app: endpoint-root
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: endpoint-root
+    spec:
+      containers:
+        - name: echo
+          image: docker.io/hashicorp/http-echo:1.0.0
+          args: ["-text", "Hello from NGINX Gatewy Fabric!", "-listen", ":8080"]
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: endpoint-blue
+  namespace: demo
+spec:
+  selector:
+    matchLabels:
+      app: endpoint-blue
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: endpoint-blue
+    spec:
+      containers:
+        - name: echo
+          image: docker.io/hashicorp/http-echo:1.0.0
+          args: ["-text", "Hello, this is blue!", "-listen", ":8080"]
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: endpoint-green
+  namespace: demo
+spec:
+  selector:
+    matchLabels:
+      app: endpoint-green
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: endpoint-green
+    spec:
+      containers:
+        - name: echo
+          image: docker.io/hashicorp/http-echo:1.0.0
+          args: ["-text", "Hello, this is green!", "-listen", ":8080"]
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: endpoint-vip
+  namespace: demo
+spec:
+  selector:
+    matchLabels:
+      app: endpoint-vip
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: endpoint-vip
+    spec:
+      containers:
+        - name: echo
+          image: docker.io/hashicorp/http-echo:1.0.0
+          args: ["-text", "Hello, this is vip!", "-listen", ":8080"]
+          ports:
+            - containerPort: 8080
+              protocol: TCP

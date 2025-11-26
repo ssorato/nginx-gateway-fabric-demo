@@ -1,0 +1,209 @@
+version: '3'
+
+vars:
+  K8S_EXTERNAL_IP:
+    sh: ifconfig > /dev/null 2>&1 && ifconfig | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | head -1 || hostname -I | cut -d" " -f 1
+  CLUSTER_NAME: gateway-api
+  REGISTRY_NAME: kind-registry
+  REGISTRY_PORT: 5001
+  CERT_MANAGER_VERSION: v1.18.2
+  NGINX_GATEWAY_FABRIC_VERSION: 2.2.1 # don't add "v"
+
+tasks:
+  default:
+    desc: "Demo NGINX Gateway Fabric"
+    deps: 
+      - task: demo
+
+  registry:
+    desc: Create registry container unless it already exists
+    run: once 
+    cmds:
+      - |-
+        if [ "$(docker inspect -f '{{ "{{" }}.State.Running {{ "}}" }}' "{{.REGISTRY_NAME}}" 2>/dev/null || true)" != 'true' ]; then
+          docker run \
+            -d --restart=always -p "127.0.0.1:{{.REGISTRY_PORT}}:5000" --network bridge --name "{{.REGISTRY_NAME}}" \
+            registry:2
+        fi
+
+  kind-cluster:
+    desc: Create the kubernet cluster using Kind
+    run: once 
+    deps:
+      - task: registry
+    cmds:
+      - |-
+        kind get clusters -q | grep -w {{.CLUSTER_NAME}}  || \
+        cat <<EOT | kind create cluster --config -
+        apiVersion: kind.x-k8s.io/v1alpha4
+        kind: Cluster
+        name: {{.CLUSTER_NAME}}
+        networking:
+          apiServerAddress: "{{.K8S_EXTERNAL_IP}}" # Expose API server on all interfaces
+          apiServerPort: 6443 # Or your desired port
+        containerdConfigPatches:
+        - |-
+          [plugins."io.containerd.grpc.v1.cri".registry]
+            config_path = "/etc/containerd/certs.d"
+        nodes:
+        - role: control-plane
+          extraPortMappings:
+          - containerPort: 31437
+            hostPort: 80
+            protocol: TCP
+            listenAddress: "{{.K8S_EXTERNAL_IP}}"
+          - containerPort: 31438
+            hostPort: 443
+            protocol: TCP
+            listenAddress: "{{.K8S_EXTERNAL_IP}}"
+        - role: worker
+          labels:
+            nodeType: worker
+        - role: worker
+          labels:
+            nodeType: worker
+        EOT
+      - |-
+        # Add the registry config to the nodes
+        REGISTRY_DIR="/etc/containerd/certs.d/localhost:{{.REGISTRY_PORT}}"
+        for node in $(kind get nodes --name {{.CLUSTER_NAME}}); do
+          docker exec "${node}" mkdir -p "${REGISTRY_DIR}"
+          cat <<EOF | docker exec -i "${node}" cp /dev/stdin "${REGISTRY_DIR}/hosts.toml"
+        [host."http://{{.REGISTRY_NAME}}:5000"]
+        EOF
+        done
+      - |-
+        # Connect the registry to the cluster network if not already connected
+        if [ "$(docker inspect -f='{{ "{{" }}json .NetworkSettings.Networks.kind{{ "}}" }}' "{{.REGISTRY_NAME}}")" = 'null' ]; then
+          docker network connect "kind" "{{.REGISTRY_NAME}}"
+        fi
+      - |-
+        # Document the local registry
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: local-registry-hosting
+          namespace: kube-public
+        data:
+          localRegistryHosting.v1: |
+            host: "localhost:{{.REGISTRY_PORT}}"
+            help: "https://kind.sigs.k8s.io/docs/user/local-registry/"
+        EOF
+
+  metrics-server:
+    desc: Install metrics server
+    run: once
+    deps:
+      - task: kind-cluster
+    cmds:
+      - kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+      - |
+        kubectl patch -n kube-system deployment metrics-server --type=json \
+          -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+
+  gateway-api-crds:
+    desc: Install Gateway API CRDs
+    run: once
+    deps:
+      - task: metrics-server
+    cmds:
+      - kubectl kustomize "https://github.com/nginx/nginx-gateway-fabric/config/crd/gateway-api/standard?ref=v{{.NGINX_GATEWAY_FABRIC_VERSION}}" | kubectl apply -f -
+  
+  cert-manager:
+    desc: Install Cert Manager - isCA is true
+    deps:
+      - task: gateway-api-crds
+    cmds:
+      - helm repo add jetstack https://charts.jetstack.io
+      - helm repo update
+      - |-
+        helm upgrade --install \
+          cert-manager jetstack/cert-manager \
+          --namespace cert-manager \
+          --create-namespace \
+          --version {{.CERT_MANAGER_VERSION}} \
+          --set config.apiVersion="controller.config.cert-manager.io/v1alpha1" \
+          --set config.kind="ControllerConfiguration" \
+          --set config.enableGatewayAPI=true \
+          --set crds.enabled=true
+      - |-
+        kubectl wait -n cert-manager \
+        --for=condition=ready pod \
+        --selector=app.kubernetes.io/instance=cert-manager \
+        --timeout=180s
+      - |-
+        cat <<EOF | kubectl apply -f - 
+        apiVersion: cert-manager.io/v1
+        kind: ClusterIssuer
+        metadata:
+          name: selfsigned-ca-issuer
+          namespace: cert-manager
+        spec:
+          selfSigned: {}
+        EOF
+      - |-
+        cat <<EOF | kubectl apply -f - 
+        apiVersion: cert-manager.io/v1
+        kind: Certificate
+        metadata:
+          name: selfsigned-ca
+          namespace: cert-manager
+        spec:
+          isCA: true
+          commonName: selfsigned-ca
+          subject:
+            organizations:
+              - ACME Inc.
+            organizationalUnits:
+              - Widgets
+          secretName: selfsigned-ca-secret
+          privateKey:
+            algorithm: RSA
+            encoding: PKCS1
+            size: 2048
+          issuerRef:
+            name: selfsigned-ca-issuer
+            kind: ClusterIssuer
+            group: cert-manager.io
+        EOF
+
+  nginx-gw-fabric:
+    desc: Deploy NGINX Gateway Fabric
+    deps:
+      - task: cert-manager
+    cmds:
+      - |
+        helm upgrade --install \
+        ngf oci://ghcr.io/nginx/charts/nginx-gateway-fabric \
+        --create-namespace -n nginx-gateway \
+        --version {{.NGINX_GATEWAY_FABRIC_VERSION}} \
+        --set nginx.service.type=NodePort \
+        --set-json 'nginx.service.nodePorts=[{"port":31437,"listenerPort":80},{"port":31438,"listenerPort":443}]' \
+        --set-json 'nginx.pod.tolerations=[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]' \
+        --set-json 'nginx.pod.nodeSelector={"kubernetes.io/hostname":"gateway-api-control-plane"}'
+      - kubectl wait --timeout=5m -n nginx-gateway deployment/ngf-nginx-gateway-fabric --for=condition=Available
+
+  demo:
+    desc: Deploy demo
+    deps:
+      - task: nginx-gw-fabric
+    cmds:
+      - kubectl apply -f k8s/01-namespace.yaml
+      - kubectl apply -f k8s/02-deployment.yaml
+      - kubectl apply -f k8s/03-service.yaml
+      - sed 's/myip/{{.K8S_EXTERNAL_IP}}/' k8s/04-gateway.yaml | kubectl apply -f -
+      - sed 's/myip/{{.K8S_EXTERNAL_IP}}/' k8s/05-route.yaml | kubectl apply -f -
+      - kubectl wait --timeout=5m -n demo deployment/http-echo-gw-nginx --for=condition=Available
+    
+  destroy:
+    desc: Destroy the kubernet cluster
+    run: once
+    prompt: This will delete the Kind cluster. Do you want to continue?
+    cmds:
+      - kind delete cluster --name {{.CLUSTER_NAME}}
+      - kind get clusters
+      - rm -f ~/.kube/config
+      - docker stop {{.REGISTRY_NAME}}
+      - docker rm {{.REGISTRY_NAME}}
+      - docker ps -a
